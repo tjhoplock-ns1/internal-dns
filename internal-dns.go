@@ -1,18 +1,25 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	api "gopkg.in/ns1/ns1-go.v2/rest"
 	// "gopkg.in/ns1/ns1-go.v2/rest/model/data"
 	"gopkg.in/ns1/ns1-go.v2/rest/model/dns"
 	// "gopkg.in/ns1/ns1-go.v2/rest/model/filter"
+	sockaddr "github.com/hashicorp/go-sockaddr"
 	log "github.com/sirupsen/logrus"
-	// sockaddr "github.com/hashicorp/go-sockaddr"
+	"github.com/sirupsen/logrus/hooks/writer"
+	"golang.org/x/exp/slices"
 )
 
 var (
@@ -33,17 +40,161 @@ func newNS1APIClient() *api.Client {
 	return client
 }
 
-func main() {
-	// fmt.Println("Private IP:")
-	// ip, _ := sockaddr.GetPrivateIP()
-	// fmt.Println(ip)
-	//
-	// hostname, err := os.Hostname()
-	// if err != nil {
-	// log it
-	// }
+func getAllRecordAnswers(r *dns.Record) []string {
+	answers := []string{}
 
-	// real
+	if r != nil {
+		for _, a := range r.Answers {
+			answers = append(answers, a.Rdata...)
+		}
+	}
+
+	return answers
+}
+
+func createOrUpdateRecord(ctx context.Context, client *api.Client, zone, domain string) error {
+	privateIP, _ := sockaddr.GetPrivateIP()
+	if privateIP != "" {
+		recType := "A"
+		logger := log.WithFields(log.Fields{
+			"zone":        zone,
+			"domain":      domain,
+			"record_type": recType,
+		})
+
+		fullDomain := domain
+		if !strings.Contains(fullDomain, zone) {
+			fullDomain = fmt.Sprintf("%s", domain+"."+zone)
+		}
+
+		rec, _, err := client.Records.Get(zone, fullDomain, recType)
+		if err != nil {
+			if err == api.ErrRecordMissing {
+				// record not found, create new
+				newRec := dns.NewRecord(zone, domain, recType)
+				ans := dns.NewAv4Answer(privateIP)
+
+				newRec.AddAnswer(ans)
+				if _, err = client.Records.Create(newRec); err != nil {
+					logger.WithFields(log.Fields{
+						"error": err,
+					}).Error("Failed to create record")
+
+					return err
+				}
+			} else {
+				// something else went wrong
+				logger.WithFields(log.Fields{
+					"error": err,
+				}).Error("Failed to get record")
+
+				return err
+			}
+		}
+
+		if !slices.Contains(getAllRecordAnswers(rec), privateIP) {
+			// record exists and needs updating
+			logger.Debug("Updating record")
+
+			newRec := dns.NewRecord(zone, domain, recType)
+			ans := dns.NewAv4Answer(privateIP)
+
+			newRec.AddAnswer(ans)
+			_, err = client.Records.Update(newRec)
+			if err != nil {
+				logger.WithFields(log.Fields{
+					"error": err,
+				}).Error("Failed to update record")
+
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func init() {
+	// init logging
+	log.SetOutput(io.Discard) // Send all logs to nowhere by default
+
+	log.AddHook(&writer.Hook{ // Send logs with level higher than warning to stderr
+		Writer: os.Stderr,
+		LogLevels: []log.Level{
+			log.PanicLevel,
+			log.FatalLevel,
+			log.ErrorLevel,
+			log.WarnLevel,
+		},
+	})
+	log.AddHook(&writer.Hook{ // Send info and debug logs to stdout
+		Writer: os.Stdout,
+		LogLevels: []log.Level{
+			log.InfoLevel,
+			log.DebugLevel,
+		},
+	})
+}
+
+func main() {
+	// flags
+	logLevelFlag := flag.String("log-level", "info", "Logging level may be one of: trace, debug, info, warning, error, fatal and panic")
+	logFmtFlag := flag.String("log-format", "logfm", "Output format of logs: [`logfmt`, `json`] (default: `logfmt`)")
+	zoneFlag := flag.String("zone", "", "The zone to add records to")
+	domainFlag := flag.String("domain", "", "The domain to create a record for (defaults to system hostname if empty)")
+
+	flag.Parse()
+
+	// validate flags
+	if *zoneFlag == "" {
+		log.WithFields(log.Fields{"flag": "zone"}).Fatal("Missing command line flag")
+	}
+
+	domain := *domainFlag
+	if domain == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.WithFields(log.Fields{"error": err}).Fatal("Failed to retrieve hostname")
+		}
+
+		domain = hostname
+	}
+
+	// set log format based on flag
+	// default is logfmt, so only make changes if json requested
+	if strings.ToLower(*logFmtFlag) == "json" {
+		log.SetFormatter(&log.JSONFormatter{})
+	}
+
+	logPrettyfierFunc := func(f *runtime.Frame) (string, string) {
+		fileName := filepath.Base(f.File)
+		funcName := filepath.Base(f.Function)
+		return fmt.Sprintf("%s()", funcName), fmt.Sprintf("%s:%d", fileName, f.Line)
+	}
+
+	// set log level based on flag
+	level, err := log.ParseLevel(*logLevelFlag)
+	if err != nil {
+		// if log level couldn't be parsed from config, default to info level
+		log.SetLevel(log.InfoLevel)
+	} else {
+		log.SetLevel(level)
+
+		if level >= log.DebugLevel {
+			// enable func/file logging
+			log.SetReportCaller(true)
+
+			if strings.ToLower(*logFmtFlag) == "json" {
+				log.SetFormatter(&log.JSONFormatter{CallerPrettyfier: logPrettyfierFunc})
+			} else {
+				log.SetFormatter(&log.TextFormatter{CallerPrettyfier: logPrettyfierFunc})
+			}
+
+		}
+
+		log.Infof("Log level set to: %s", level)
+	}
+
 	logger := log.WithFields(log.Fields{
 		"version":    Version,
 		"build_date": BuildDate,
@@ -52,40 +203,23 @@ func main() {
 	})
 	logger.Info("Internal DNS server started")
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	client := newNS1APIClient()
-	zones, _, err := client.Zones.List()
-	if err != nil {
-		log.WithFields(log.Fields{"error": err}).Error("Failed to list zones")
+
+	if err := createOrUpdateRecord(ctx, client, *zoneFlag, domain); err != nil {
+		log.WithFields(log.Fields{
+			"error":  err,
+			"domain": domain,
+			"zone":   *zoneFlag,
+		}).Error("Failed to set record for internal DNS")
+	} else {
+		log.WithFields(log.Fields{
+			"domain": domain,
+			"zone":   *zoneFlag,
+		}).Info("Internal DNS record set")
 	}
 
-	for _, z := range zones {
-		fmt.Println("Zone: ", z)
-		fmt.Printf("Full zone object: %#v\n", z)
-	}
-
-	testA := dns.NewRecord("ns1.work.tjhop.io", "test", "A")
-	testAAnswer := dns.NewAv4Answer("1.2.3.4")
-	testAAnswer.Meta.Priority = 1
-
-	testA.AddAnswer(testAAnswer)
-	_, err = client.Records.Update(testA)
-	if err != nil {
-		log.WithFields(log.Fields{"error": err}).Error("Failed to create record")
-	}
-
-	// TODO: need to make a `UpdateOrCreateRecord` function -- 
-	// create only works for new records
-	// update only works for existing records
-	// need to check if exists to determine if create/update
-	newA := dns.NewRecord("ns1.work.tjhop.io", "new", "A")
-	newAAnswer := dns.NewAv4Answer("1.2.3.4")
-	newAAnswer.Meta.Priority = 1
-
-	newA.AddAnswer(newAAnswer)
-	_, err = client.Records.Update(newA)
-	if err != nil {
-		log.WithFields(log.Fields{"error": err}).Error("Failed to create record")
-	}
-	
 	logger.Info("Internal DNS exited")
 }
